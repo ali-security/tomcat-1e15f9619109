@@ -506,8 +506,6 @@ class StreamProcessor extends AbstractProcessor implements NonPipeliningProcesso
         // - invalid (incorrectly formatted) :authority header
         // - invalid (incorrectly formatted) host header
         if (request.getNote(Request.NOTE_BAD_REQUEST) != null) {
-            // Notes not reset when request is recycled
-            request.setNote(Request.NOTE_BAD_REQUEST, null);
             return false;
         }
 

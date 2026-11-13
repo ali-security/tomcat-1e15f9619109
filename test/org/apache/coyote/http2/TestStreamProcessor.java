@@ -42,6 +42,7 @@ import org.apache.catalina.startup.Tomcat;
 import org.apache.tomcat.util.compat.JrePlatform;
 import org.apache.tomcat.util.http.FastHttpDateFormat;
 import org.apache.tomcat.util.http.Method;
+import org.apache.tomcat.util.http.MimeHeaders;
 
 public class TestStreamProcessor extends Http2TestBase {
 
@@ -432,6 +433,96 @@ public class TestStreamProcessor extends Http2TestBase {
 
         // The status code is the most important thing to test
         Assert.assertTrue(output.getTrace().startsWith(expected.toString()));
+    }
+
+
+    @Test
+    public void testBadRequestNoteClearedOnRecycle() throws Exception {
+        http2Connect();
+
+        // Allow host as a trailer field so it is processed after the request has been validated
+        http2Protocol.getHttp11Protocol().setAllowedTrailerHeaders("host");
+
+        // Disable overhead protection for window update as it breaks some tests
+        http2Protocol.setOverheadWindowUpdateThreshold(0);
+
+        // Ensure the Request used for the upgrade (stream 1) has been returned to the pool
+        int requestCount = waitForRequestCount(1);
+
+        byte[] headersFrameHeader = new byte[9];
+        ByteBuffer headersPayload = ByteBuffer.allocate(128);
+        byte[] dataFrameHeader = new byte[9];
+        ByteBuffer dataPayload = ByteBuffer.allocate(256);
+
+        buildPostRequest(headersFrameHeader, headersPayload, false, dataFrameHeader, dataPayload, null, true, 3);
+
+        // Write the headers
+        writeFrame(headersFrameHeader, headersPayload);
+        // Body (without end of stream)
+        writeFrame(dataFrameHeader, dataPayload);
+
+        /*
+         * Wait for the window updates triggered by the application reading the request body. This ensures that the
+         * request has been validated before the trailer fields are received.
+         */
+        parser.readFrame();
+        parser.readFrame();
+        String trace = output.getTrace();
+        Assert.assertTrue(trace, trace.contains("0-WindowSize-[256]\n"));
+        Assert.assertTrue(trace, trace.contains("3-WindowSize-[256]\n"));
+        output.clearTrace();
+
+        // Trailers with an invalid host. This marks the request as bad after it has been validated.
+        byte[] trailerFrameHeader = new byte[9];
+        ByteBuffer trailerPayload = ByteBuffer.allocate(128);
+        MimeHeaders trailerHeaders = new MimeHeaders();
+        trailerHeaders.addValue("host").setString("local!host:" + getPort());
+        hpackEncoder.encode(trailerHeaders, trailerPayload);
+        trailerPayload.flip();
+        ByteUtil.setThreeBytes(trailerFrameHeader, 0, trailerPayload.limit());
+        trailerFrameHeader[3] = FrameType.HEADERS.getIdByte();
+        // Flags. end of headers (0x04) and end of stream (0x01)
+        trailerFrameHeader[4] = 0x05;
+        // Stream id
+        ByteUtil.set31Bits(trailerFrameHeader, 5, 3);
+        writeFrame(trailerFrameHeader, trailerPayload);
+
+        // Response headers and body for stream 3
+        parser.readFrame();
+        parser.readFrame();
+        trace = output.getTrace();
+        Assert.assertTrue(trace, trace.startsWith("3-HeadersStart\n3-Header-[:status]-[200]\n"));
+        Assert.assertTrue(trace, trace.endsWith("3-EndOfStream\n"));
+        output.clearTrace();
+
+        // Ensure the Request used for stream 3 has been returned to the pool so it is re-used for stream 5
+        waitForRequestCount(requestCount + 1);
+
+        sendSimpleGetRequest(5);
+
+        // Headers
+        parser.readFrame();
+        trace = output.getTrace();
+        // If the bad request note was not cleared when stream 3 was recycled, stream 5 would see a 400 response
+        Assert.assertTrue(trace, trace.startsWith("5-HeadersStart\n5-Header-[:status]-[200]\n"));
+        // Body
+        parser.readFrame();
+        Assert.assertEquals(getSimpleResponseTrace(5), output.getTrace());
+    }
+
+
+    private int waitForRequestCount(int expected) throws InterruptedException {
+        int count = 0;
+        while (http2Protocol.getGlobal().getRequestCount() < expected && count < 100) {
+            Thread.sleep(50);
+            count++;
+        }
+        /*
+         * The request count is updated when the StreamProcessor is recycled. That happens just before the Stream is
+         * recycled and the Request is returned to the pool. Allow time for the Stream to be recycled.
+         */
+        Thread.sleep(100);
+        return http2Protocol.getGlobal().getRequestCount();
     }
 
 
