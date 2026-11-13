@@ -46,6 +46,7 @@ public class TestOcspSoftFail extends OcspBaseTest {
 
     @Test(expected = SSLHandshakeException.class)
     public void testNoResponderWithoutSoftFail() throws Exception {
+        assumeOcspFailureDetectable();
         try {
             doTest(false, false, ClientCertificateVerification.ENABLED, false, Boolean.FALSE);
         } catch (SocketException | SSLException e) {

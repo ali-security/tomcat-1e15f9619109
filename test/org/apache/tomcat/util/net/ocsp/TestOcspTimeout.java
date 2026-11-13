@@ -63,6 +63,7 @@ public class TestOcspTimeout extends OcspBaseTest {
 
     @Test(expected = SSLHandshakeException.class)
     public void testTimeoutWithoutSoftFail() throws Exception {
+        assumeOcspFailureDetectable();
         try {
             doTest(false, false, ClientCertificateVerification.ENABLED, false, Boolean.FALSE);
         } catch (SocketTimeoutException | SocketException e) {

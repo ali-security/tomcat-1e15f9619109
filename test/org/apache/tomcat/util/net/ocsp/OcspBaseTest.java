@@ -100,6 +100,19 @@ public class OcspBaseTest extends TomcatBaseTest {
     }
 
 
+    /*
+     * The test certificates list two OCSP URLs in their Authority Information Access extension. The OpenSSL FFM
+     * (panama) OpenSSLEngine in this version only parses an extension holding a single OCSP URL (multiple URL support
+     * was added upstream in 23b9f256) so, with OpenSSL trust, it logs a parse error and never queries the OCSP
+     * responder. Tests that require the handshake to fail because the OCSP check failed therefore cannot pass for that
+     * configuration and are skipped. The OpenSSL FFM implementation is not included in tomcat-embed-core.
+     */
+    protected void assumeOcspFailureDetectable() {
+        Assume.assumeFalse("OpenSSL FFM cannot parse the multiple OCSP URLs in the test certificates",
+                "OpenSSL-FFM".equals(connectorName) && useOpenSSLTrust);
+    }
+
+
     protected void doTest(boolean clientCertValid, boolean serverCertValid, ClientCertificateVerification verifyClientCert,
             boolean verifyServerCert) throws Exception {
         doTest(clientCertValid, serverCertValid, verifyClientCert, verifyServerCert, null);

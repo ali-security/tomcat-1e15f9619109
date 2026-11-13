@@ -95,6 +95,9 @@ public class TestOcspSoftFailInternalError extends OcspBaseTest {
     @Test
     public void test() throws Exception {
         Assume.assumeNotNull(ocspResponder);
+        if (handshakeFailureExpected) {
+            assumeOcspFailureDetectable();
+        }
         try {
             doTest(clientCertValid, true, ClientCertificateVerification.ENABLED, false, softFail);
             if (handshakeFailureExpected) {
