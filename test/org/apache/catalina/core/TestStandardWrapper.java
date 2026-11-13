@@ -248,6 +248,8 @@ public class TestStandardWrapper extends TomcatBaseTest {
         ctx.addRoleMapping("testRole", "very-complex-role-name");
 
         Wrapper wrapper = Tomcat.addServlet(ctx, "servlet", RoleAllowServlet.class.getName());
+        wrapper.addSecurityReference("testSecurityRoleRef", "very-complex-role-name");
+        wrapper.addSecurityReference("testSecurityRoleRef2", "testRole");
         ctx.addServletMappingDecoded("/", "servlet");
 
         ctx.setLoginConfig(new LoginConfig("BASIC", null, null, null));
@@ -305,6 +307,48 @@ public class TestStandardWrapper extends TomcatBaseTest {
         Assert.assertEquals(200, rc);
     }
 
+    /*
+     * A servlet's security-role-ref alias must only apply to isUserInRole() calls made by that servlet. It must not be
+     * used when evaluating security constraints, otherwise it can grant access to a constrained role.
+     */
+    @Test
+    public void testSecurityRoleRefNotUsedForConstraints() throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+
+        Context ctx = getProgrammaticRootContext();
+
+        Wrapper wrapper = Tomcat.addServlet(ctx, "servlet", RoleDenyServlet.class.getName());
+        // Alias the constrained role to a role the user does hold
+        wrapper.addSecurityReference("otherRole", "testRole");
+        ctx.addServletMappingDecoded("/", "servlet");
+
+        ctx.setLoginConfig(new LoginConfig("BASIC", null, null, null));
+        ctx.getPipeline().addValve(new BasicAuthenticator());
+
+        TesterMapRealm realm = new TesterMapRealm();
+        realm.addUser("testUser", "testPwd");
+        realm.addUserRole("testUser", "testRole");
+        ctx.setRealm(realm);
+
+        tomcat.start();
+
+        Principal p = realm.authenticate("testUser", "testPwd");
+        Assert.assertNotNull(p);
+        Assert.assertTrue(realm.hasRole(wrapper, p, "testRole"));
+        Assert.assertFalse(realm.hasRole(wrapper, p, "otherRole"));
+
+        ByteChunk bc = new ByteChunk();
+        Map<String,List<String>> reqHeaders = new HashMap<>();
+        List<String> authHeaders = new ArrayList<>();
+        // testUser, testPwd
+        authHeaders.add("Basic dGVzdFVzZXI6dGVzdFB3ZA==");
+        reqHeaders.put("Authorization", authHeaders);
+
+        int rc = getUrl("http://localhost:" + getPort() + "/", bc, reqHeaders, null);
+
+        Assert.assertEquals(HttpServletResponse.SC_FORBIDDEN, rc);
+    }
+
     private void doTestSecurityAnnotationsAddServlet(boolean useCreateServlet) throws Exception {
 
         // Setup Tomcat instance
@@ -351,6 +395,8 @@ public class TestStandardWrapper extends TomcatBaseTest {
             TesterMapRealm realm = new TesterMapRealm();
             realm.addUser("testUser", "testPwd");
             realm.addUserRole("testUser", "testRole");
+            realm.addUserRole("testUser", "testSecurityRoleRef");
+            realm.addUserRole("testUser", "testSecurityRoleRef2");
             ctx.setRealm(realm);
 
             ctx.setLoginConfig(new LoginConfig("BASIC", null, null, null));
@@ -429,6 +475,14 @@ public class TestStandardWrapper extends TomcatBaseTest {
     @ServletSecurity(@HttpConstraint(rolesAllowed = "testRole"))
     public static class RoleAllowServlet extends TestServlet {
         private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+            if (!req.isUserInRole("testSecurityRoleRef") || !req.isUserInRole("testSecurityRoleRef2")) {
+                throw new ServletException("Non functional security-role-ref");
+            }
+            super.doGet(req, resp);
+        }
     }
 
     @ServletSecurity(@HttpConstraint(rolesAllowed = "otherRole"))
