@@ -16,9 +16,16 @@
  */
 package org.apache.coyote.http2;
 
+import java.io.File;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+
+import javax.net.ssl.SNIHostName;
+import javax.net.ssl.SNIServerName;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSocket;
 
 import org.junit.Assert;
 import org.junit.Test;
@@ -29,6 +36,10 @@ import org.apache.coyote.ContinueResponseTiming;
 import org.apache.coyote.http11.AbstractHttp11Protocol;
 import org.apache.tomcat.util.http.Method;
 import org.apache.tomcat.util.http.MimeHeaders;
+import org.apache.tomcat.util.net.SSLHostConfig;
+import org.apache.tomcat.util.net.SSLHostConfigCertificate;
+import org.apache.tomcat.util.net.SSLHostConfigCertificate.Type;
+import org.apache.tomcat.util.net.TesterSupport;
 
 /**
  * Unit tests for Section 8.1 of <a href="https://tools.ietf.org/html/rfc7540">RFC 7540</a>. <br>
@@ -301,7 +312,7 @@ public class TestHttp2Section_8_1 extends Http2TestBase {
         parser.readFrame();
 
         String trace = output.getTrace();
-        Assert.assertTrue(trace, trace.contains("3-Header-[:status]-[400]"));
+        Assert.assertTrue(trace, trace.contains("3-RST-[1]"));
     }
 
 
@@ -325,7 +336,110 @@ public class TestHttp2Section_8_1 extends Http2TestBase {
         parser.readFrame();
 
         String trace = output.getTrace();
-        Assert.assertTrue(trace, trace.contains("3-Header-[:status]-[400]"));
+        Assert.assertTrue(trace, trace.contains("3-RST-[1]"));
+    }
+
+
+    @Test
+    public void testAuthorityHeaderMissing() throws Exception {
+        http2Connect();
+
+        // Neither :authority nor host
+        List<Header> headers = new ArrayList<>(3);
+        headers.add(new Header(":method", Method.GET));
+        headers.add(new Header(":scheme", "http"));
+        headers.add(new Header(":path", "/simple"));
+
+        byte[] headersFrameHeader = new byte[9];
+        ByteBuffer headersPayload = ByteBuffer.allocate(128);
+
+        buildGetRequest(headersFrameHeader, headersPayload, null, headers, 3);
+
+        writeFrame(headersFrameHeader, headersPayload);
+
+        parser.readFrame();
+
+        String trace = output.getTrace();
+        Assert.assertTrue(trace, trace.contains("3-RST-[1]"));
+    }
+
+
+    @Test
+    public void testAuthorityHeaderMissingStrictSni() throws Exception {
+        enableHttp2(true);
+
+        Tomcat tomcat = getTomcatInstance();
+        Connector connector = tomcat.getConnector();
+        Assert.assertTrue(connector.setProperty("strictSni", "true"));
+
+        // Add a second TLS virtual host in addition to the default
+        SSLHostConfig sslHostConfig = new SSLHostConfig();
+        SSLHostConfigCertificate certificate = new SSLHostConfigCertificate(sslHostConfig, Type.UNDEFINED);
+        sslHostConfig.addCertificate(certificate);
+        certificate.setCertificateKeystoreFile(new File(TesterSupport.LOCALHOST_RSA_JKS).getAbsolutePath());
+        certificate.setCertificateKeystorePassword(TesterSupport.JKS_PASS);
+        sslHostConfig.setHostName("foobar");
+        connector.addSslHostConfig(sslHostConfig);
+
+        configureAndStartWebApplication();
+
+        openClientConnection(true);
+
+        // Use SNI to select the non-default TLS virtual host (before the TLS handshake starts)
+        SSLSocket sslSocket = (SSLSocket) s;
+        SSLParameters params = sslSocket.getSSLParameters();
+        List<SNIServerName> serverNames = new ArrayList<>(1);
+        serverNames.add(new SNIHostName("foobar"));
+        params.setServerNames(serverNames);
+        sslSocket.setSSLParameters(params);
+
+        // The host used for the HTTP upgrade must be consistent with the SNI host name
+        byte[] upgradeRequest = ("GET /simple HTTP/1.1\r\n" + "Host: foobar:" + getPort() + "\r\n" + "Connection: " +
+                DEFAULT_CONNECTION_HEADER_VALUE + "\r\n" + "Upgrade: h2c\r\n" + EMPTY_HTTP2_SETTINGS_HEADER + "\r\n")
+                .getBytes(StandardCharsets.ISO_8859_1);
+        os.write(upgradeRequest);
+        os.flush();
+        Assert.assertTrue("Failed to read HTTP Upgrade response", readHttpUpgradeResponse());
+
+        sendClientPreface();
+        validateHttp2InitialResponse();
+
+        // :authority inconsistent with the SNI host name - rejected by strict SNI
+        List<Header> headers = new ArrayList<>(4);
+        headers.add(new Header(":method", Method.GET));
+        headers.add(new Header(":scheme", "https"));
+        headers.add(new Header(":path", "/simple"));
+        headers.add(new Header(":authority", "localhost:" + getPort()));
+
+        byte[] headersFrameHeader = new byte[9];
+        ByteBuffer headersPayload = ByteBuffer.allocate(128);
+
+        buildGetRequest(headersFrameHeader, headersPayload, null, headers, 3);
+
+        writeFrame(headersFrameHeader, headersPayload);
+
+        parser.readFrame();
+
+        String trace = output.getTrace();
+        Assert.assertTrue(trace, trace.contains("3-RST-[1]"));
+        output.clearTrace();
+
+        // Neither :authority nor host - must not bypass strict SNI
+        headers = new ArrayList<>(3);
+        headers.add(new Header(":method", Method.GET));
+        headers.add(new Header(":scheme", "https"));
+        headers.add(new Header(":path", "/simple"));
+
+        headersPayload.clear();
+
+        buildGetRequest(headersFrameHeader, headersPayload, null, headers, 5);
+
+        writeFrame(headersFrameHeader, headersPayload);
+
+        parser.readFrame();
+
+        trace = output.getTrace();
+        Assert.assertTrue(trace, trace.contains("5-RST-[1]"));
     }
 
 
