@@ -17,6 +17,8 @@
 package org.apache.coyote.http2;
 
 import java.nio.ByteBuffer;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 
 import org.junit.Assert;
 import org.junit.Test;
@@ -129,6 +131,86 @@ public class TestHpack {
         HpackDecoder decoder = new HpackDecoder();
         decoder.setHeaderEmitter(new HeadersListener(headers2));
         decoder.decode(output);
+    }
+
+
+    @Test
+    public void testEmitHeaderHoldsStreamEmitterLock() throws Exception {
+        MimeHeaders headers = new MimeHeaders();
+        headers.setValue("x-test").setString("value");
+        ByteBuffer output = ByteBuffer.allocate(512);
+        HpackEncoder encoder = new HpackEncoder();
+        encoder.encode(headers, output);
+        output.flip();
+
+        HpackDecoder decoder = new HpackDecoder();
+        MimeHeaders headers2 = new MimeHeaders();
+        AtomicReference<Boolean> lockHeld = new AtomicReference<>();
+        decoder.setHeaderEmitter(new HeadersListener(headers2) {
+            @Override
+            public void emitHeader(String name, String value) {
+                lockHeld.set(Boolean.valueOf(decoder.getStreamEmitterLock().isHeldByCurrentThread()));
+                super.emitHeader(name, value);
+            }
+        });
+        decoder.decode(output);
+
+        Assert.assertEquals("value", headers2.getHeader("x-test"));
+        Assert.assertEquals(Boolean.TRUE, lockHeld.get());
+        Assert.assertFalse(decoder.getStreamEmitterLock().isLocked());
+    }
+
+
+    @Test
+    public void testEmitHeaderAfterConcurrentStreamReplacement() throws Exception {
+        MimeHeaders headers = new MimeHeaders();
+        headers.setValue("x-injected").setString("value");
+        ByteBuffer output = ByteBuffer.allocate(512);
+        HpackEncoder encoder = new HpackEncoder();
+        encoder.encode(headers, output);
+        output.flip();
+
+        HpackDecoder decoder = new HpackDecoder();
+        MimeHeaders replacedHeaders = new MimeHeaders();
+        MimeHeaders sinkHeaders = new MimeHeaders();
+        HeadersListener replaced = new HeadersListener(replacedHeaders);
+        HeadersListener sink = new HeadersListener(sinkHeaders);
+        decoder.setHeaderEmitter(replaced);
+
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread parserThread = new Thread(() -> {
+            try {
+                decoder.decode(output);
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        });
+
+        /*
+         * Simulate the container thread replacing the stream (under the stream emitter lock) while the parser thread
+         * is decoding a header for that stream.
+         */
+        ReentrantLock streamEmitterLock = decoder.getStreamEmitterLock();
+        streamEmitterLock.lock();
+        try {
+            parserThread.start();
+            int count = 0;
+            while (!streamEmitterLock.hasQueuedThread(parserThread) && count < 500) {
+                Thread.sleep(10);
+                count++;
+            }
+            Assert.assertTrue(streamEmitterLock.hasQueuedThread(parserThread));
+            decoder.compareAndSetHeaderEmitter(replaced, sink);
+        } finally {
+            streamEmitterLock.unlock();
+        }
+        parserThread.join(10000);
+
+        Assert.assertFalse(parserThread.isAlive());
+        Assert.assertNull(failure.get());
+        // The header must not be passed to the replaced stream
+        Assert.assertNull(replacedHeaders.getHeader("x-injected"));
+        Assert.assertEquals("value", sinkHeaders.getHeader("x-injected"));
     }
 
 
